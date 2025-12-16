@@ -6,12 +6,22 @@ from pathlib import Path
 import streamlit as st
 from openai import OpenAI
 
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 
-# -------------------------------------------------
-# STREAMLIT + OPENAI SETUP
-# -------------------------------------------------
 
-# Get API key (Streamlit Cloud uses st.secrets; local can use env var)
+# =================================================
+# CONFIG
+# =================================================
+
+OPENAI_MAX_BYTES = 25 * 1024 * 1024  # 25MB per OpenAI request
+
+
+# =================================================
+# OPENAI SETUP
+# =================================================
+
 api_key = ""
 try:
     api_key = st.secrets["OPENAI_API_KEY"]
@@ -19,27 +29,49 @@ except Exception:
     api_key = os.environ.get("OPENAI_API_KEY", "")
 
 if not api_key:
-    st.error("OpenAI API key not found. Add it in Streamlit Secrets or set OPENAI_API_KEY.")
+    st.error("Missing OPENAI_API_KEY. Add it in Streamlit Secrets.")
     st.stop()
 
 client = OpenAI(api_key=api_key)
 
-# OpenAI per transcription request limit (~25MB)
-OPENAI_MAX_BYTES = 25 * 1024 * 1024
+
+# =================================================
+# GOOGLE DRIVE HELPERS
+# =================================================
+
+def get_drive_service():
+    sa_info = dict(st.secrets["google_service_account"])
+    creds = Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    return build("drive", "v3", credentials=creds)
 
 
-# -------------------------------------------------
-# FFMPEG HELPERS (convert + chunk)
-# -------------------------------------------------
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id],
+    }
 
-def run_ffmpeg(args: list[str]) -> None:
+    created = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+    ).execute()
+
+    return created["id"], created.get("webViewLink")
+
+
+# =================================================
+# FFMPEG HELPERS
+# =================================================
+
+def run_ffmpeg(args):
     p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr[:2000])
 
-
-def convert_to_mp3(input_path: str, out_mp3: str, bitrate_kbps: int = 48) -> None:
-    """Convert any audio/video to a speech-optimized mp3 (smaller size)."""
+def convert_to_mp3(input_path, out_mp3, bitrate_kbps=48):
     run_ffmpeg([
         "ffmpeg", "-y",
         "-i", input_path,
@@ -50,9 +82,7 @@ def convert_to_mp3(input_path: str, out_mp3: str, bitrate_kbps: int = 48) -> Non
         out_mp3
     ])
 
-
-def chunk_audio(input_mp3: str, out_dir: str, chunk_seconds: int) -> list[str]:
-    """Split audio into chunks so each chunk stays under OpenAI's 25MB limit."""
+def chunk_audio(input_mp3, out_dir, chunk_seconds):
     out_pattern = str(Path(out_dir) / "chunk_%03d.mp3")
     run_ffmpeg([
         "ffmpeg", "-y",
@@ -65,110 +95,112 @@ def chunk_audio(input_mp3: str, out_dir: str, chunk_seconds: int) -> list[str]:
     return sorted(str(p) for p in Path(out_dir).glob("chunk_*.mp3"))
 
 
-# -------------------------------------------------
+# =================================================
 # UI
-# -------------------------------------------------
+# =================================================
 
 st.set_page_config(page_title="AI Transcriber & Summarizer", layout="centered")
 
 st.title("🎙️ AI Audio / Video Transcriber")
-st.write(
-    "Upload an audio or video file. The app will transcribe it using OpenAI "
-    "and then generate a clean summary."
-)
+st.write("Upload an audio or video file. The app will transcribe it and generate a summary.")
 
-uploaded_file = st.file_uploader("Upload audio or video", type=None, key="main_uploader")
-
-chunk_minutes = st.slider("Chunk size (minutes)", 5, 20, 10, 1)
+uploaded_file = st.file_uploader("Upload audio or video", type=None)
+chunk_minutes = st.slider("Chunk size (minutes)", 5, 20, 10)
 bitrate_kbps = st.selectbox("Compression bitrate (kbps)", [32, 48, 64], index=1)
+save_to_drive = st.checkbox("Save transcript + summary to Google Drive", value=True)
 
-st.write("Max upload size (MB):", st.get_option("server.maxUploadSize"))
-st.write("File selected:", uploaded_file.name if uploaded_file else None)
+if uploaded_file and st.button("🚀 Transcribe & Summarize"):
 
-if uploaded_file:
-    file_size_mb = uploaded_file.size / (1024 * 1024)
-    st.info(f"Uploaded file size: {file_size_mb:.2f} MB")
+    with st.spinner("Preparing and chunking audio…"):
+        with tempfile.TemporaryDirectory() as workdir:
+            suffix = Path(uploaded_file.name).suffix or ".bin"
+            input_path = str(Path(workdir) / f"input{suffix}")
+            with open(input_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-    if st.button("🚀 Transcribe & Summarize"):
-        with st.spinner("Preparing file (convert + chunk)…"):
-            with tempfile.TemporaryDirectory() as workdir:
-                # Save upload to disk
-                suffix = Path(uploaded_file.name).suffix or ".bin"
-                in_path = str(Path(workdir) / f"input{suffix}")
-                with open(in_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+            mp3_path = str(Path(workdir) / "audio.mp3")
+            convert_to_mp3(input_path, mp3_path, bitrate_kbps)
 
-                # Convert to compressed mp3
-                mp3_path = str(Path(workdir) / "speech.mp3")
-                convert_to_mp3(in_path, mp3_path, bitrate_kbps=int(bitrate_kbps))
+            chunks = chunk_audio(mp3_path, workdir, chunk_minutes * 60)
 
-                # Chunk
-                chunks = chunk_audio(mp3_path, workdir, chunk_seconds=chunk_minutes * 60)
+            st.write(f"Transcribing {len(chunks)} chunk(s)…")
+            prog = st.progress(0.0)
+            transcript_parts = []
 
-                st.write(f"Transcribing {len(chunks)} chunk(s)…")
-                prog = st.progress(0.0)
+            for i, chunk in enumerate(chunks, start=1):
+                if os.path.getsize(chunk) > OPENAI_MAX_BYTES:
+                    st.error("A chunk exceeded 25MB. Reduce bitrate or chunk size.")
+                    st.stop()
 
-                transcript_parts: list[str] = []
+                with open(chunk, "rb") as audio:
+                    transcription = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio
+                    )
 
-                for i, chunk_path in enumerate(chunks, start=1):
-                    # Safety check: each chunk must be <= 25MB for OpenAI
-                    if os.path.getsize(chunk_path) > OPENAI_MAX_BYTES:
-                        st.error(
-                            "A chunk is still over 25MB. "
-                            "Lower the bitrate or reduce the chunk size."
-                        )
-                        st.stop()
+                transcript_parts.append(transcription.text)
+                prog.progress(i / len(chunks))
 
-                    with open(chunk_path, "rb") as audio_file:
-                        try:
-                            transcription = client.audio.transcriptions.create(
-                                model="whisper-1",
-                                file=audio_file,
-                            )
-                        except Exception as e:
-                            st.error(f"OpenAI transcription failed: {type(e).__name__}")
-                            st.exception(e)
-                            st.stop()
+            transcript_text = "\n\n".join(transcript_parts)
 
-                    transcript_parts.append(transcription.text)
-                    prog.progress(i / len(chunks))
+    st.success("Transcription complete!")
 
-                transcript_text = "\n\n".join(transcript_parts)
+    # =================================================
+    # SUMMARY
+    # =================================================
 
-        st.success("Transcription complete!")
+    with st.spinner("Generating summary…"):
+        prompt = (
+            "Summarize the following transcript.\n\n"
+            "Return:\n"
+            "1) A short title\n"
+            "2) 5 key bullet points\n"
+            "3) A short paragraph summary\n\n"
+            f"TRANSCRIPT:\n{transcript_text}"
+        )
 
-        # -------------------------------------------------
-        # SUMMARY (GPT)
-        # -------------------------------------------------
-        with st.spinner("Generating summary…"):
-            prompt = (
-                "Summarize the following transcript.\n\n"
-                "Return:\n"
-                "1) A short title\n"
-                "2) 5 key bullet points\n"
-                "3) A short paragraph summary\n\n"
-                f"TRANSCRIPT:\n{transcript_text}"
+        summary_response = client.responses.create(
+            model="gpt-4o-mini",
+            input=prompt
+        )
+
+        summary_text = summary_response.output_text
+
+    # =================================================
+    # GOOGLE DRIVE EXPORT
+    # =================================================
+
+    if save_to_drive:
+        try:
+            folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+            base = Path(uploaded_file.name).stem
+
+            t_id, t_link = upload_text_to_drive(
+                f"{base}_transcript.txt", transcript_text, folder_id
+            )
+            s_id, s_link = upload_text_to_drive(
+                f"{base}_summary.txt", summary_text, folder_id
             )
 
-            try:
-                summary_response = client.responses.create(
-                    model="gpt-4o-mini",
-                    input=prompt,
-                )
-                summary_text = summary_response.output_text
-            except Exception as e:
-                st.error(f"OpenAI summarization failed: {type(e).__name__}")
-                st.exception(e)
-                st.stop()
+            st.success("Saved to Google Drive!")
+            if t_link:
+                st.link_button("Open Transcript in Drive", t_link)
+            if s_link:
+                st.link_button("Open Summary in Drive", s_link)
 
-        # -------------------------------------------------
-        # DISPLAY RESULTS
-        # -------------------------------------------------
-        st.subheader("📝 Summary")
-        st.write(summary_text)
+        except Exception as e:
+            st.error("Google Drive upload failed")
+            st.exception(e)
 
-        st.subheader("📄 Full Transcript")
-        st.text_area("Transcript", transcript_text, height=350)
+    # =================================================
+    # DISPLAY
+    # =================================================
 
-        st.download_button("Download Summary (.txt)", summary_text, file_name="summary.txt")
-        st.download_button("Download Transcript (.txt)", transcript_text, file_name="transcript.txt")
+    st.subheader("📝 Summary")
+    st.write(summary_text)
+
+    st.subheader("📄 Full Transcript")
+    st.text_area("Transcript", transcript_text, height=350)
+
+    st.download_button("Download Summary (.txt)", summary_text, "summary.txt")
+    st.download_button("Download Transcript (.txt)", transcript_text, "transcript.txt")
