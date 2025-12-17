@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,19 +10,18 @@ from openai import OpenAI
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.errors import HttpError
 
 
 # =================================================
 # CONFIG
 # =================================================
-
-OPENAI_MAX_BYTES = 25 * 1024 * 1024  # 25MB per OpenAI request
+OPENAI_MAX_BYTES = 25 * 1024 * 1024  # 25MB per OpenAI transcription request
 
 
 # =================================================
 # OPENAI SETUP
 # =================================================
-
 api_key = ""
 try:
     api_key = st.secrets["OPENAI_API_KEY"]
@@ -38,9 +38,15 @@ client = OpenAI(api_key=api_key)
 # =================================================
 # GOOGLE DRIVE HELPERS
 # =================================================
-
 def get_drive_service():
+    # Expects Streamlit secrets:
+    # [google_service_account]
+    # type="service_account"
+    # ...
     sa_info = dict(st.secrets["google_service_account"])
+
+    # If your org policy blocks drive.file, switch to:
+    # scopes=["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/drive.file"],
@@ -48,30 +54,48 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-    file_metadata = {
-        "name": filename,
-        "parents": [folder_id],
-    }
+def upload_text_to_drive(filename: str, content: str, folder_id: str):
+    service = get_drive_service()
+    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+
+    file_metadata = {"name": filename, "parents": [folder_id]}
 
     created = service.files().create(
         body=file_metadata,
         media_body=media,
         fields="id, webViewLink",
+        supportsAllDrives=True,  # harmless for normal Drive, helpful for Shared Drives
     ).execute()
 
     return created["id"], created.get("webViewLink")
 
 
+def drive_debug_error(e: Exception) -> None:
+    """
+    Display the real Drive API error payload so you can fix permissions quickly.
+    """
+    if isinstance(e, HttpError):
+        st.error("Google Drive API error (details below).")
+        try:
+            st.code(e.content.decode("utf-8"))
+        except Exception:
+            st.code(str(e))
+    else:
+        st.error(f"Google Drive upload failed: {type(e).__name__}")
+        st.exception(e)
+
+
 # =================================================
 # FFMPEG HELPERS
 # =================================================
-
 def run_ffmpeg(args):
     p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr[:2000])
 
+
 def convert_to_mp3(input_path, out_mp3, bitrate_kbps=48):
+    # Speech-friendly compression: mono + 16kHz + low bitrate
     run_ffmpeg([
         "ffmpeg", "-y",
         "-i", input_path,
@@ -81,6 +105,7 @@ def convert_to_mp3(input_path, out_mp3, bitrate_kbps=48):
         "-b:a", f"{bitrate_kbps}k",
         out_mp3
     ])
+
 
 def chunk_audio(input_mp3, out_dir, chunk_seconds):
     out_pattern = str(Path(out_dir) / "chunk_%03d.mp3")
@@ -94,35 +119,52 @@ def chunk_audio(input_mp3, out_dir, chunk_seconds):
     ])
     return sorted(str(p) for p in Path(out_dir).glob("chunk_*.mp3"))
 
-def upload_text_to_drive(filename: str, content: str, folder_id: str):
-    service = get_drive_service()
-    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
-
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    created = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink",
-    ).execute()
-
-    return created["id"], created.get("webViewLink")
 
 # =================================================
 # UI
 # =================================================
-
 st.set_page_config(page_title="AI Transcriber & Summarizer", layout="centered")
 
 st.title("🎙️ AI Audio / Video Transcriber")
 st.write("Upload an audio or video file. The app will transcribe it and generate a summary.")
+
+# Optional: confirm ffmpeg exists (helpful for local/Codespaces)
+st.caption(f"ffmpeg detected: {shutil.which('ffmpeg') is not None}")
 
 uploaded_file = st.file_uploader("Upload audio or video", type=None)
 chunk_minutes = st.slider("Chunk size (minutes)", 5, 20, 10)
 bitrate_kbps = st.selectbox("Compression bitrate (kbps)", [32, 48, 64], index=1)
 save_to_drive = st.checkbox("Save transcript + summary to Google Drive", value=True)
 
-if uploaded_file and st.button("🚀 Transcribe & Summarize"):
+# Drive debug panel (super useful)
+with st.expander("Google Drive: debug / test access", expanded=False):
+    st.write("Secrets present:", {
+        "GDRIVE_FOLDER_ID": "GDRIVE_FOLDER_ID" in st.secrets,
+        "google_service_account": "google_service_account" in st.secrets
+    })
 
+    if st.button("Test Drive access to folder"):
+        try:
+            folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+            service = get_drive_service()
+            meta = service.files().get(
+                fileId=folder_id,
+                fields="id,name,mimeType",
+                supportsAllDrives=True,
+            ).execute()
+            st.success(f"✅ Service account can access folder: {meta['name']} ({meta['mimeType']})")
+            st.info("If uploads still fail, it’s usually a permissions/scope policy on file creation.")
+        except Exception as e:
+            drive_debug_error(e)
+            st.info(
+                "Most common fix: share the Drive folder with your service account email "
+                "(the client_email in your secrets) as Editor."
+            )
+
+if uploaded_file and st.button("🚀 Transcribe & Summarize"):
+    # -----------------------------
+    # TRANSCRIBE (convert + chunk)
+    # -----------------------------
     with st.spinner("Preparing and chunking audio…"):
         with tempfile.TemporaryDirectory() as workdir:
             suffix = Path(uploaded_file.name).suffix or ".bin"
@@ -131,7 +173,7 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
                 f.write(uploaded_file.getbuffer())
 
             mp3_path = str(Path(workdir) / "audio.mp3")
-            convert_to_mp3(input_path, mp3_path, bitrate_kbps)
+            convert_to_mp3(input_path, mp3_path, int(bitrate_kbps))
 
             chunks = chunk_audio(mp3_path, workdir, chunk_minutes * 60)
 
@@ -157,10 +199,9 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
 
     st.success("Transcription complete!")
 
-    # =================================================
+    # -----------------------------
     # SUMMARY
-    # =================================================
-
+    # -----------------------------
     with st.spinner("Generating summary…"):
         prompt = (
             "Summarize the following transcript.\n\n"
@@ -175,39 +216,38 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
             model="gpt-4o-mini",
             input=prompt
         )
-
         summary_text = summary_response.output_text
 
-    # =================================================
+    # -----------------------------
     # GOOGLE DRIVE EXPORT
-    # =================================================
-
+    # -----------------------------
     if save_to_drive:
         try:
             folder_id = st.secrets["GDRIVE_FOLDER_ID"]
             base = Path(uploaded_file.name).stem
 
-            t_id, t_link = upload_text_to_drive(
-                f"{base}_transcript.txt", transcript_text, folder_id
-            )
-            s_id, s_link = upload_text_to_drive(
-                f"{base}_summary.txt", summary_text, folder_id
-            )
+            transcript_name = f"{base}_transcript.txt"
+            summary_name = f"{base}_summary.txt"
 
-            st.success("Saved to Google Drive!")
+            t_id, t_link = upload_text_to_drive(transcript_name, transcript_text, folder_id)
+            s_id, s_link = upload_text_to_drive(summary_name, summary_text, folder_id)
+
+            st.success("✅ Saved to Google Drive!")
             if t_link:
                 st.link_button("Open Transcript in Drive", t_link)
             if s_link:
                 st.link_button("Open Summary in Drive", s_link)
 
         except Exception as e:
-            st.error("Google Drive upload failed")
-            st.exception(e)
+            drive_debug_error(e)
+            st.info(
+                "If you see a 403: share the folder with the service account email as Editor. "
+                "If you see a 404: folder ID is wrong or not shared."
+            )
 
-    # =================================================
+    # -----------------------------
     # DISPLAY
-    # =================================================
-
+    # -----------------------------
     st.subheader("📝 Summary")
     st.write(summary_text)
 
