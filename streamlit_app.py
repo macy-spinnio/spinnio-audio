@@ -212,6 +212,7 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
             transcript_text = "\n\n".join(transcript_parts)
 
     st.success("Transcription complete!")
+    st.session_state["transcript_text"] = transcript_text
 
     # -----------------------------
     # SUMMARY
@@ -232,47 +233,43 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
         )
         summary_text = summary_response.output_text
 
+    st.session_state["summary_text"] = summary_text
+
     # -----------------------------
-    # GOOGLE DRIVE EXPORT
+    # GOOGLE DRIVE EXPORT (IN ITS OWN FOLDER)
     # -----------------------------
-if save_to_drive:
-    try:
-        root_folder_id = st.secrets["GDRIVE_FOLDER_ID"]
-        base = Path(uploaded_file.name).stem
+    if save_to_drive:
+        try:
+            root_folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+            base = Path(uploaded_file.name).stem
 
-        # Folder name (safe + readable)
-        upload_folder_name = f"{base}"
+            upload_folder_id, upload_folder_link = create_drive_folder(
+                folder_name=base,
+                parent_folder_id=root_folder_id
+            )
 
-        # Create subfolder for this upload
-        upload_folder_id, upload_folder_link = create_drive_folder(
-            upload_folder_name,
-            root_folder_id
-        )
+            t_id, t_link = upload_text_to_drive(
+                f"{base}_transcript.txt",
+                transcript_text,
+                upload_folder_id
+            )
+            s_id, s_link = upload_text_to_drive(
+                f"{base}_summary.txt",
+                summary_text,
+                upload_folder_id
+            )
 
-        # Upload files into that folder
-        t_id, t_link = upload_text_to_drive(
-            f"{base}_transcript.txt",
-            transcript_text,
-            upload_folder_id
-        )
-        s_id, s_link = upload_text_to_drive(
-            f"{base}_summary.txt",
-            summary_text,
-            upload_folder_id
-        )
+            st.success("✅ Saved to Google Drive in its own folder!")
+            if upload_folder_link:
+                st.link_button("Open folder in Drive", upload_folder_link)
+            if t_link:
+                st.link_button("Open Transcript", t_link)
+            if s_link:
+                st.link_button("Open Summary", s_link)
 
-        st.success("✅ Saved to Google Drive in its own folder!")
-        if upload_folder_link:
-            st.link_button("Open folder in Drive", upload_folder_link)
-        if t_link:
-            st.link_button("Open Transcript", t_link)
-        if s_link:
-            st.link_button("Open Summary", s_link)
-
-    except Exception as e:
-        drive_debug_error(e)
-        st.stop()
-
+        except Exception as e:
+            drive_debug_error(e)
+            st.stop()
 
     # -----------------------------
     # DISPLAY
