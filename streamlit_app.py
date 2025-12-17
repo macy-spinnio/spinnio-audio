@@ -38,6 +38,7 @@ client = OpenAI(api_key=api_key)
 # =================================================
 # GOOGLE DRIVE HELPERS
 # =================================================
+
 def get_drive_service():
     # Expects Streamlit secrets:
     # [google_service_account]
@@ -49,10 +50,23 @@ def get_drive_service():
     # scopes=["https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(
         sa_info,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
     return build("drive", "v3", credentials=creds)
 
+def create_drive_folder(folder_name: str, parent_folder_id: str):
+    service = get_drive_service()
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_folder_id],
+    }
+    created = service.files().create(
+        body=metadata,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return created["id"], created.get("webViewLink")
 
 def upload_text_to_drive(filename: str, content: str, folder_id: str):
     service = get_drive_service()
@@ -222,28 +236,42 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
     # GOOGLE DRIVE EXPORT
     # -----------------------------
     if save_to_drive:
-        try:
-            folder_id = st.secrets["GDRIVE_FOLDER_ID"]
-            base = Path(uploaded_file.name).stem
+    try:
+        root_folder_id = st.secrets["GDRIVE_FOLDER_ID"]
+        base = Path(uploaded_file.name).stem
 
-            transcript_name = f"{base}_transcript.txt"
-            summary_name = f"{base}_summary.txt"
+        # Folder name (safe + readable)
+        upload_folder_name = f"{base}"
 
-            t_id, t_link = upload_text_to_drive(transcript_name, transcript_text, folder_id)
-            s_id, s_link = upload_text_to_drive(summary_name, summary_text, folder_id)
+        # Create subfolder for this upload
+        upload_folder_id, upload_folder_link = create_drive_folder(
+            upload_folder_name,
+            root_folder_id
+        )
 
-            st.success("✅ Saved to Google Drive!")
-            if t_link:
-                st.link_button("Open Transcript in Drive", t_link)
-            if s_link:
-                st.link_button("Open Summary in Drive", s_link)
+        # Upload files into that folder
+        t_id, t_link = upload_text_to_drive(
+            f"{base}_transcript.txt",
+            transcript_text,
+            upload_folder_id
+        )
+        s_id, s_link = upload_text_to_drive(
+            f"{base}_summary.txt",
+            summary_text,
+            upload_folder_id
+        )
 
-        except Exception as e:
-            drive_debug_error(e)
-            st.info(
-                "If you see a 403: share the folder with the service account email as Editor. "
-                "If you see a 404: folder ID is wrong or not shared."
-            )
+        st.success("✅ Saved to Google Drive in its own folder!")
+        if upload_folder_link:
+            st.link_button("Open folder in Drive", upload_folder_link)
+        if t_link:
+            st.link_button("Open Transcript", t_link)
+        if s_link:
+            st.link_button("Open Summary", s_link)
+
+    except Exception as e:
+        drive_debug_error(e)
+        st.stop()
 
     # -----------------------------
     # DISPLAY
