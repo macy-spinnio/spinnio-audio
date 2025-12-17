@@ -235,7 +235,7 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
     # -----------------------------
     # GOOGLE DRIVE EXPORT
     # -----------------------------
-    if save_to_drive:
+if save_to_drive:
     try:
         root_folder_id = st.secrets["GDRIVE_FOLDER_ID"]
         base = Path(uploaded_file.name).stem
@@ -272,6 +272,7 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
     except Exception as e:
         drive_debug_error(e)
         st.stop()
+
 
     # -----------------------------
     # DISPLAY
