@@ -94,6 +94,18 @@ def chunk_audio(input_mp3, out_dir, chunk_seconds):
     ])
     return sorted(str(p) for p in Path(out_dir).glob("chunk_*.mp3"))
 
+def upload_text_to_drive(filename: str, content: str, folder_id: str):
+    service = get_drive_service()
+    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    created = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink",
+    ).execute()
+
+    return created["id"], created.get("webViewLink")
 
 # =================================================
 # UI
