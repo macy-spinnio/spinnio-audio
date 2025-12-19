@@ -267,9 +267,13 @@ if uploaded_file and st.button("🚀 Transcribe & Summarize"):
                     segments = transcription.get("segments") or []
 
                 for seg in segments:
-                    start = seg.get("start", 0) + chunk_offset
-                    end = seg.get("end", 0) + chunk_offset
-                    text = seg.get("text", "").strip()
+                    start = (
+                        getattr(seg, "start", None) or seg.get("start", 0)
+                    ) + chunk_offset
+                    end = (
+                        getattr(seg, "end", None) or seg.get("end", 0)
+                    ) + chunk_offset
+                    text = (getattr(seg, "text", None) or seg.get("text", "")).strip()
                     timestamped_segments.append(
                         {
                             "start": start,
